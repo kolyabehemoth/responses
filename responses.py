@@ -1,29 +1,48 @@
 from __future__ import (absolute_import, print_function, division,
                         unicode_literals)
-
+import httplib
 import _io
 import inspect
 import json as json_module
 import logging
 import re
 import six
+import socket
+import urllib2
 
 from collections import namedtuple, Sequence, Sized
+from httplib import HTTPConnection, HTTPSConnection
 from functools import update_wrapper
 from cookies import Cookies
 from requests.adapters import HTTPAdapter
-from requests.exceptions import ConnectionError
 from requests.sessions import REDIRECT_STATI
 from requests.utils import cookiejar_from_dict
+from urllib3.connectionpool import HTTPSConnectionPool
+
+class MatchError(Exception):
+    pass
+
+Request = namedtuple('Request', ['method', 'url', 'body', 'headers',
+                                     'scheme', 'host', 'port'])
 
 try:
     from requests.packages.urllib3.response import HTTPResponse
 except ImportError:
     from urllib3.response import HTTPResponse
 
+try:
+    import ssl
+except ImportError:
+    _have_ssl = True
+else:
+    _have_ssl = False
+
 if six.PY2:
     from urlparse import urlparse, parse_qsl, urlsplit, urlunsplit
     from urllib import quote
+    def _exec(code, g):
+        exec('exec code in g')
+
 else:
     from urllib.parse import urlparse, parse_qsl, urlsplit, urlunsplit, quote
 
@@ -51,6 +70,9 @@ UNSET = object()
 Call = namedtuple('Call', ['request', 'response'])
 
 _real_send = HTTPAdapter.send
+_real_urlopen = HTTPSConnectionPool.urlopen
+_real_urllib2_urlopen = urllib2.urlopen
+
 
 _wrapper_template = """\
 def wrapper%(signature)s:
@@ -254,7 +276,7 @@ class BaseResponse(object):
             return False
 
         if not self._url_matches(self.url, request.url,
-                                 self.match_querystring):
+                self.match_querystring):
             return False
 
         return True
@@ -340,6 +362,12 @@ class CallbackResponse(BaseResponse):
             headers=headers,
             preload_content=False, )
 
+TARGET = [
+       'requests.adapters.HTTPAdapter.send',
+       'urllib2.urlopen',
+       'urllib3.connectionpool.HTTPConnectionPool.urlopen',
+       'urllib3.connectionpool.HTTPSConnectionPool.urlopen',
+]
 
 class RequestsMock(object):
     DELETE = 'DELETE'
@@ -354,14 +382,17 @@ class RequestsMock(object):
     def __init__(self,
                  assert_all_requests_are_fired=True,
                  response_callback=None,
+                 allow_external_requests=False,
                  passthru_prefixes=(),
-                 target='requests.adapters.HTTPAdapter.send'):
+                 target=TARGET):
         self._calls = CallList()
         self.reset()
         self.assert_all_requests_are_fired = assert_all_requests_are_fired
         self.response_callback = response_callback
         self.passthru_prefixes = tuple(passthru_prefixes)
         self.target = target
+        self.allow_external_requests = allow_external_requests
+        self.patchers = []
 
     def reset(self):
         self._matches = []
@@ -432,6 +463,19 @@ class RequestsMock(object):
         if _has_unicode(prefix):
             prefix = _clean_unicode(prefix)
         self.passthru_prefixes += (prefix, )
+
+    def enable_external_requests(self):
+        """
+        Allows tests to make real network calls
+        """
+        self.allow_external_requests = True
+
+    def disable_external_requests(self):
+        """
+        Disable tests
+
+        """
+        self.allow_external_requests = False
 
     def remove(self, method_or_response=None, url=None):
         """
@@ -525,6 +569,14 @@ class RequestsMock(object):
         match = self._find_match(request)
         resp_callback = self.response_callback
 
+        if self.allow_external_requests:
+            logger.info(
+                'request.allowed-external', extra={
+                'url': request.url,
+            })
+            return _real_send(adapter, request)
+
+
         if match is None:
             if request.url.startswith(self.passthru_prefixes):
                 logger.info(
@@ -533,13 +585,7 @@ class RequestsMock(object):
                     })
                 return _real_send(adapter, request)
 
-            error_msg = 'Connection refused: {0} {1}'.format(
-                request.method, request.url)
-            response = ConnectionError(error_msg)
-            response.request = request
-
-            self._calls.add(request, response)
-            response = resp_callback(response) if resp_callback else response
+            response = self._no_match(request, resp_callback)
             raise response
 
         try:
@@ -567,15 +613,171 @@ class RequestsMock(object):
         self._calls.add(request, response)
         return response
 
+    def _on_urlopen(self, pool, method, url, body=None, headers=None, **kwargs):
+        built_url = "{0}://{1}{2}".format(pool.scheme, pool.host, url)
+
+        request = Request(method, built_url, body, headers, pool.scheme,
+                pool.host, pool.port)
+
+        match = self._find_match(request)
+        resp_callback = self.response_callback
+
+        if self.allow_external_requests:
+            logger.info(
+                'request.allowed-external', extra={
+                    'url': request.url,
+                })
+            return _real_urlopen(pool, method, built_url, body=body, headers=headers, **kwargs)
+
+        if match is None:
+            if request.url.startswith(self.passthru_prefixes):
+                logger.info(
+                    'request.allowed-passthru', extra={
+                        'url': request.url,
+                    })
+                return _real_urlopen(pool, method, built_url, body=body, headers=headers, **kwargs)
+            response = self._on_no_match(request, resp_callback)
+            raise response
+
+        try:
+            response = match.get_response(request)
+            # match.get_response(request), )
+        except Exception as response:
+            match.call_count += 1
+            self._calls.add(request, response)
+            response = resp_callback(response) if resp_callback else response
+            raise
+
+        try:
+            resp_cookies = Cookies.from_request(response.headers['set-cookie'])
+            response.cookies = cookiejar_from_dict(
+                dict((v.name, v.value) for _, v in resp_cookies.items()))
+        except (KeyError, TypeError):
+            pass
+
+        response = resp_callback(response) if resp_callback else response
+        match.call_count += 1
+        self._calls.add(request, response)
+        return response
+
+    def _on_no_match(self, request, resp_callback):
+        error_msg = 'Cannot match any mock for the following request: {0} {1}'.format(
+        request.method, request.url)
+        response = MatchError(error_msg)
+        response.request = request
+
+        self._calls.add(request, response)
+        response = resp_callback(response) if resp_callback else response
+        return response
+
+    def _on_urllib2_urlopen(self, url, data=None, timeout=None, cafile=None, capath=None, cadefault=False, context=None):
+        request = Request(url.get_method(),
+                url.get_full_url(),
+                data,
+                url.headers,
+                url.get_type(),
+                url.get_host(),
+                url.port)
+
+        match = self._find_match(request)
+        resp_callback = self.response_callback
+        if self.allow_external_requests:
+                logger.info(
+                    'request.allowed-external', extra={
+                        'url': request.url,
+                    })
+                return _real_urllib2_urlopen(url)
+
+
+
+        if match is None:
+            if request.url.startswith(self.passthru_prefixes):
+                logger.info(
+                    'request.allowed-passthru', extra={
+                        'url': request.url,
+                    })
+                return _real_urllib2_urlopen(url)
+
+            response = self._on_no_match(request, resp_callback)
+            raise response
+
+        class MockHTTPSConnection(HTTPSConnection):
+            def getresponse(buffering=False):
+                response = match.get_response(request)
+                response.msg = ''
+                return response
+
+        class MockHTTPConnection(HTTPConnection):
+            def getresponse(buffering=False):
+                response = match.get_response(request)
+                response.msg = ''
+                return response
+
+        class MockHTTPSHandler(urllib2.AbstractHTTPHandler):
+            def __init__(self, debuglevel=0, context=None):
+                urllib2.AbstractHTTPHandler.__init__(self, debuglevel)
+                self._context = context
+
+            def https_open(self, req):
+                return self.do_open(MockHTTPSConnection, req, context=self._context)
+
+        class MockHTTPHandler(urllib2.AbstractHTTPHandler):
+            def http_open(self, req):
+                return self.do_open(MockHTTPConnection, req)
+
+        response = match.get_response(request)
+
+        opener = urllib2.OpenerDirector()
+        opener.add_handler(MockHTTPHandler())
+
+        if cafile or cadefault:
+            if context is not None:
+                raise ValueError("You can't pass both context and any of cafile, capath, and "
+                        "cadefault"
+                )
+            if not _have_ssl:
+                raise ValueError('SSL support not available')
+            context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH,
+                                                 cafile=cafile,
+                                                 capath=capath)
+            https_handler = MockHTTPSHandler(context=context)
+            opener.add_handler(https_handler)
+        elif context:
+            https_handler = MockHTTPSHandler(context=context)
+            opener = opener.add_handler(https_handler)
+        elif hasattr(httplib, 'HTTPS'):
+            opener.add_handler(MockHTTPSHandler())
+
+        self._calls.add(request, response)
+        return opener.open(url, data, timeout)
+
     def start(self):
-        def unbound_on_send(adapter, request, *a, **kwargs):
+        def _unbound_on_send(adapter, request, *a, **kwargs):
             return self._on_request(adapter, request, *a, **kwargs)
 
-        self._patcher = std_mock.patch(target=self.target, new=unbound_on_send)
-        self._patcher.start()
+        def _unbound_on_urlopen(pool, method, url, body=None, headers=None, **kwargs):
+            return self._on_urlopen(pool, method, url, body=body, headers=headers, **kwargs)
+
+        def _unbound_on_urllib2_urlopen(url, data=None, timeout=socket._GLOBAL_DEFAULT_TIMEOUT,
+                cafile=None, capath=None, cadefault=False, context=None):
+            return self._on_urllib2_urlopen(url, data, timeout, cafile, capath, cadefault, context)
+
+        unbound_mapping = {
+            'requests.adapters.HTTPAdapter.send': _unbound_on_send,
+            'urllib2.urlopen': _unbound_on_urllib2_urlopen,
+            'urllib3.connectionpool.HTTPSConnectionPool.urlopen': _unbound_on_urlopen,
+            'urllib3.connectionpool.HTTPConnectionPool.urlopen': _unbound_on_urlopen
+        }
+
+        for target in self.target:
+            self.patchers.append(std_mock.patch(target=target, new=unbound_mapping[target]))
+
+        for patcher in self.patchers:
+            patcher.start()
 
     def stop(self, allow_assert=True):
-        self._patcher.stop()
+        for patcher in self.patchers:
+            patcher.stop()
         if not self.assert_all_requests_are_fired:
             return
         if not allow_assert:
