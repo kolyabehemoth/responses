@@ -776,7 +776,8 @@ class RequestsMock(object):
         }
 
         for target in self.target:
-            self.patchers.append(std_mock.patch(target=target, new=unbound_mapping[target]))
+            patch = std_mock.patch(target=target, new=unbound_mapping[target])
+            self.patchers.append(patch)
 
         for patcher in self.patchers:
             patcher.start()
