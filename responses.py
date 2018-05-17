@@ -785,6 +785,7 @@ class RequestsMock(object):
     def stop(self, allow_assert=True):
         for patcher in self.patchers:
             patcher.stop()
+            self.patchers.remove(patcher)
         if not self.assert_all_requests_are_fired:
             return
         if not allow_assert:
