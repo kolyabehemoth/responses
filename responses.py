@@ -402,6 +402,7 @@ class RequestsMock(object):
 
     def reset(self):
         self._matches = []
+        self.patchers = []
         self._calls.reset()
 
     def add(
@@ -785,7 +786,6 @@ class RequestsMock(object):
     def stop(self, allow_assert=True):
         for patcher in self.patchers:
             patcher.stop()
-        self.patchers = []
         if not self.assert_all_requests_are_fired:
             return
         if not allow_assert:
