@@ -24,7 +24,8 @@ if 'test' in sys.argv:
 install_requires = [
     'requests>=2.0',
     'cookies',
-    'six'
+    'six',
+    'brotli'
 ]
 
 tests_require = [
@@ -69,7 +70,7 @@ class PyTest(TestCommand):
 
 setup(
     name='responses',
-    version='0.11.0.dev0',
+    version='0.12.0-dev.0',
     author='David Cramer',
     description=(
         'A utility library for mocking out the `requests` Python library.'),
