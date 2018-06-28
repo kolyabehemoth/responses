@@ -1,6 +1,9 @@
 from __future__ import (absolute_import, print_function, division,
                         unicode_literals)
+import brotli
+import cgi
 import httplib
+import gzip
 import _io
 import inspect
 import json as json_module
@@ -9,12 +12,15 @@ import re
 import six
 import socket
 import urllib2
+import urllib3
+import zlib
 
 from collections import namedtuple, Sequence, Sized
 from httplib import HTTPConnection, HTTPSConnection
 from functools import update_wrapper
 from cookies import Cookies
 from requests.adapters import HTTPAdapter
+from requests.exceptions import ConnectionError
 from requests.sessions import REDIRECT_STATI
 from requests.utils import cookiejar_from_dict
 from urllib3.connectionpool import HTTPSConnectionPool, HTTPConnectionPool
@@ -73,6 +79,7 @@ Call = namedtuple('Call', ['request', 'response'])
 
 _real_send = HTTPAdapter.send
 _real_urllib2_urlopen = urllib2.urlopen
+UrllibRequest = urllib2.Request
 
 scheme_to_urlopen = {
     'https': HTTPSConnectionPool.urlopen,
@@ -195,6 +202,29 @@ def _handle_body(body):
         return body
     return BufferIO(body)
 
+
+def _uncompress_body(body, encoding):
+    if not any(encoding):
+        return body
+
+    for enc in encoding:
+        remaining = encoding[1:]
+        if enc == 'gzip':
+            gzip_f = gzip.GzipFile(fileobj=body)
+            return _uncompress_body(gzip_f.read(), remaining)
+        elif enc == 'deflate':
+            return _uncompress_body(zlib.decompress(body), remaining)
+        elif enc == 'br':
+            return _uncompress_body(brotli.decompress(body), remaining)
+        else:
+            return _uncompress_body(body, remaining)
+
+def _get_content_headers(headers):
+    _, params = cgi.parse_header(headers.get('Content-Type'))
+    content_type = params.get('charset')
+    content_encoding = headers.get('Content-Encoding', "")
+    content_encodings = [e.strip() for e in content_encoding.split(',')]
+    return content_type, content_encodings
 
 class BaseResponse(object):
     content_type = None
@@ -591,8 +621,11 @@ class RequestsMock(object):
                         'url': request.url,
                     })
                 return _real_send(adapter, request)
-
-            response = self._on_no_match(request, resp_callback)
+            try:
+                real_response = _real_send(adapter, request)
+                response = self._on_no_match(request, resp_callback, actual_response=real_response.content)
+            except ConnectionError:
+                response = self._on_no_match(request, resp_callback, actual_response='ConnectionError: actual response could not be returned')
             raise response
 
         try:
@@ -643,7 +676,16 @@ class RequestsMock(object):
                         'url': request.url,
                     })
                 return scheme_to_urlopen[pool.scheme](pool, method, built_url, body=body, headers=headers, **kwargs)
-            response = self._on_no_match(request, resp_callback)
+            try:
+                real_response = scheme_to_urlopen[pool.scheme](pool, method, built_url, body=body, headers=headers, **kwargs)
+                charset, content_encodings = _get_content_headers(real_response.headers)
+                body = _handle_body(real_response.read())
+                uncompressed_body = _uncompress_body(body, content_encodings)
+                if charset:
+                    uncompressed_body = uncompressed_body.decode(charset)
+                response = self._on_no_match(request, resp_callback, actual_response=uncompressed_body)
+            except urllib3.exceptions.ConnectionError:
+                response = self._on_no_match(request, resp_callback, actual_response='ConnectionError: actual response could not be returned')
             raise response
 
         try:
@@ -667,9 +709,9 @@ class RequestsMock(object):
         self._calls.add(request, response)
         return response
 
-    def _on_no_match(self, request, resp_callback):
-        error_msg = 'Cannot match any mock for the following request: {0} {1}'.format(
-        request.method, request.url)
+    def _on_no_match(self, request, resp_callback, actual_response=None):
+        error_msg = 'Cannot match any mock for the following request: {0} {1}, with response: {2}'.format(
+        request.method, request.url, actual_response)
         response = MatchError(error_msg)
         response.request = request
 
@@ -678,13 +720,14 @@ class RequestsMock(object):
         return response
 
     def _on_urllib2_urlopen(self, url, data=None, timeout=None, cafile=None, capath=None, cadefault=False, context=None):
-        request = Request(url.get_method(),
-                url.get_full_url(),
+        urllib_req = UrllibRequest(url, data)
+        request = Request(urllib_req.get_method(),
+                urllib_req.get_full_url(),
                 data,
-                url.headers,
-                url.get_type(),
-                url.get_host(),
-                url.port)
+                urllib_req.headers,
+                urllib_req.get_type(),
+                urllib_req.get_host(),
+                urllib_req.port)
 
         match = self._find_match(request)
         resp_callback = self.response_callback
@@ -704,8 +747,17 @@ class RequestsMock(object):
                         'url': request.url,
                     })
                 return _real_urllib2_urlopen(url)
-
-            response = self._on_no_match(request, resp_callback)
+            try:
+                real_response = _real_urllib2_urlopen(url)
+                body = real_response.read()
+                content_type = real_response.headers.get('content-type')
+                if content_type:
+                    _, params = cgi.parse_header(content_type)
+                    charset = params.get('charset')
+                    body = body.decode(charset)
+                response = self._on_no_match(request, resp_callback, actual_response=body)
+            except urllib2.UrlError:
+                response = self._on_no_match(request, resp_callback, actual_response='ConnectionError: actual response could not be returned')
             raise response
 
         class MockHTTPSConnection(HTTPSConnection):
